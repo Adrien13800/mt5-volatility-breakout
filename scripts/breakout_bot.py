@@ -405,13 +405,17 @@ def process_symbol(symbol: str):
         tick_vol, vol_threshold,
     )
 
+    # ── Conditions individuelles ──
+    bb_long = close > bb_upper
+    bb_short = close < bb_lower
+    ema_long = close > ema
+    ema_short = close < ema
+    vol_ok = tick_vol > vol_threshold
+    rsi_long = 50 < rsi < 70
+    rsi_short = 30 < rsi < 50
+
     # ── Signal Long ──
-    if (
-        close > bb_upper
-        and close > ema
-        and tick_vol > vol_threshold
-        and 50 < rsi < 70
-    ):
+    if bb_long and ema_long and vol_ok and rsi_long:
         log.info("%s — Signal LONG : breakout BB + EMA + RSI + volume.", symbol)
         sl_dist = ATR_SL_MULT * atr_capped
         tp_dist = ATR_TP_MULT * atr_capped
@@ -425,12 +429,7 @@ def process_symbol(symbol: str):
             }
 
     # ── Signal Short ──
-    elif (
-        close < bb_lower
-        and close < ema
-        and tick_vol > vol_threshold
-        and 30 < rsi < 50
-    ):
+    elif bb_short and ema_short and vol_ok and rsi_short:
         log.info("%s — Signal SHORT : breakdown BB + EMA + RSI + volume.", symbol)
         sl_dist = ATR_SL_MULT * atr_capped
         tp_dist = ATR_TP_MULT * atr_capped
@@ -442,6 +441,24 @@ def process_symbol(symbol: str):
                 "best_price": fill_price,
                 "atr_entry": atr_capped,
             }
+
+    # ── Aucun signal — détail des conditions ──
+    else:
+        failed = []
+        if not bb_long and not bb_short:
+            failed.append("BB (prix entre les bandes)")
+        if not vol_ok:
+            failed.append(f"Volume ({int(tick_vol)}/{int(vol_threshold)})")
+        if not rsi_long and not rsi_short:
+            failed.append(f"RSI ({rsi:.1f} hors zone)")
+        if bb_long and not ema_long:
+            failed.append("EMA (prix < EMA, long invalidé)")
+        if bb_short and not ema_short:
+            failed.append("EMA (prix > EMA, short invalidé)")
+        log.info(
+            "%s — Pas de signal | Conditions manquantes : %s",
+            symbol, " | ".join(failed) if failed else "aucune condition proche",
+        )
 
 
 def log_account_status():
