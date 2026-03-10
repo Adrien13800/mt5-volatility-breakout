@@ -66,14 +66,69 @@ PARIS_TZ = pytz.timezone("Europe/Paris")
 LOG_FORMAT = "%(asctime)s | %(levelname)-8s | %(message)s"
 LOG_DATEFMT = "%Y-%m-%d %H:%M:%S"
 
-logging.basicConfig(level=logging.INFO, format=LOG_FORMAT, datefmt=LOG_DATEFMT)
+# --- ANSI colors for terminal ---
+class _C:
+    RESET   = "\033[0m"
+    BOLD    = "\033[1m"
+    DIM     = "\033[2m"
+    GREEN   = "\033[92m"
+    RED     = "\033[91m"
+    YELLOW  = "\033[93m"
+    CYAN    = "\033[96m"
+    MAGENTA = "\033[95m"
+    WHITE   = "\033[97m"
+    BG_GREEN = "\033[42m"
+    BG_RED   = "\033[41m"
+
+class ColoredFormatter(logging.Formatter):
+    LEVEL_COLORS = {
+        logging.DEBUG:    _C.DIM,
+        logging.INFO:     _C.CYAN,
+        logging.WARNING:  _C.YELLOW,
+        logging.ERROR:    _C.RED + _C.BOLD,
+        logging.CRITICAL: _C.BG_RED + _C.WHITE + _C.BOLD,
+    }
+
+    def format(self, record):
+        color = self.LEVEL_COLORS.get(record.levelno, _C.RESET)
+        ts = self.formatTime(record, self.datefmt)
+        level = record.levelname.ljust(8)
+        msg = record.getMessage()
+        return f"{_C.DIM}{ts}{_C.RESET} {color}{level}{_C.RESET} {msg}"
+
+# Console handler (colored)
+_console = logging.StreamHandler()
+_console.setLevel(logging.INFO)
+_console.setFormatter(ColoredFormatter(LOG_FORMAT, datefmt=LOG_DATEFMT))
+
+logging.basicConfig(level=logging.INFO, handlers=[_console])
 log = logging.getLogger("BreakoutBot")
 
-file_handler = RotatingFileHandler(
+# General log file (all messages)
+_file_all = RotatingFileHandler(
     "breakout_bot.log", maxBytes=5_000_000, backupCount=3, encoding="utf-8"
 )
-file_handler.setFormatter(logging.Formatter(LOG_FORMAT, datefmt=LOG_DATEFMT))
-log.addHandler(file_handler)
+_file_all.setFormatter(logging.Formatter(LOG_FORMAT, datefmt=LOG_DATEFMT))
+log.addHandler(_file_all)
+
+# Trade-only log file
+_trade_formatter = logging.Formatter("%(asctime)s | %(message)s", datefmt=LOG_DATEFMT)
+_file_trades = RotatingFileHandler(
+    "trades.log", maxBytes=5_000_000, backupCount=5, encoding="utf-8"
+)
+_file_trades.setFormatter(_trade_formatter)
+_file_trades.setLevel(logging.INFO)
+trade_log = logging.getLogger("BreakoutBot.trades")
+trade_log.addHandler(_file_trades)
+trade_log.propagate = False  # don't duplicate into main log
+
+# Error-only log file
+_file_errors = RotatingFileHandler(
+    "errors.log", maxBytes=5_000_000, backupCount=5, encoding="utf-8"
+)
+_file_errors.setFormatter(logging.Formatter(LOG_FORMAT, datefmt=LOG_DATEFMT))
+_file_errors.setLevel(logging.ERROR)
+log.addHandler(_file_errors)
 
 # ─────────────────────────── STATE ───────────────────────────────────
 
@@ -269,19 +324,23 @@ def open_order(symbol: str, direction: str, sl_dist: float, tp_dist: float) -> f
     }
     result = mt5.order_send(request)
     if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
-        log.error("Ordre %s échoué sur %s : %s", direction.upper(), symbol, result)
+        retcode = result.retcode if result else "None"
+        comment = result.comment if result else "no response"
+        log.error(
+            "Ordre %s échoué sur %s | retcode=%s | %s",
+            direction.upper(), symbol, retcode, comment,
+        )
         return None
 
     fill_price = result.price if result.price else price
+    tag = f"{_C.BG_GREEN}{_C.WHITE} TRADE " if direction == "long" else f"{_C.BG_RED}{_C.WHITE} TRADE "
     log.info(
-        "✓ %s %s @ %.5f | lot=%.3f | SL=%.5f | TP=%.5f | ticket=%d",
-        direction.upper(),
-        symbol,
-        fill_price,
-        lot_size,
-        sl,
-        tp,
-        result.order,
+        "%s %s %s @ %.5f | lot=%.3f | SL=%.5f | TP=%.5f | ticket=%d%s",
+        tag, direction.upper(), symbol, fill_price, lot_size, sl, tp, result.order, _C.RESET,
+    )
+    trade_log.info(
+        "OPEN %s %s @ %.5f | lot=%.3f | SL=%.5f | TP=%.5f | ticket=%d",
+        direction.upper(), symbol, fill_price, lot_size, sl, tp, result.order,
     )
     return fill_price
 
@@ -305,7 +364,11 @@ def modify_sl(symbol: str, ticket: int, new_sl: float, current_tp: float) -> boo
         log.error("Modification SL échouée ticket %d : %s", ticket, result)
         return False
 
-    log.info("✓ TRAIL %s ticket=%d | nouveau SL=%.5f", symbol, ticket, new_sl)
+    log.info(
+        "%s TRAIL %s ticket=%d | nouveau SL=%.5f%s",
+        _C.MAGENTA, symbol, ticket, new_sl, _C.RESET,
+    )
+    trade_log.info("TRAIL %s ticket=%d | nouveau SL=%.5f", symbol, ticket, new_sl)
     return True
 
 
@@ -398,11 +461,16 @@ def process_symbol(symbol: str):
     if not in_trading_session():
         return
 
-    log.info(
-        "%s | close=%.2f | BB_up=%.2f | BB_lo=%.2f | EMA=%.2f | RSI=%.1f | "
-        "ATRc=%.2f | vol=%d (seuil=%.0f)",
-        symbol, close, bb_upper, bb_lower, ema, rsi, atr_capped,
-        tick_vol, vol_threshold,
+    vol_icon = f"{_C.GREEN}✓{_C.RESET}" if tick_vol > vol_threshold else f"{_C.RED}✗{_C.RESET}"
+    rsi_color = _C.GREEN if 50 < rsi < 70 else (_C.RED if 30 < rsi < 50 else _C.YELLOW)
+    print(
+        f"  {_C.BOLD}{symbol:<10}{_C.RESET}"
+        f"  close {_C.WHITE}{close:>10.2f}{_C.RESET}"
+        f"  │ BB [{bb_lower:.2f} — {bb_upper:.2f}]"
+        f"  │ EMA {ema:.2f}"
+        f"  │ RSI {rsi_color}{rsi:5.1f}{_C.RESET}"
+        f"  │ ATR {atr_capped:.2f}"
+        f"  │ vol {int(tick_vol):>5}/{int(vol_threshold):<5} {vol_icon}"
     )
 
     # ── Conditions individuelles ──
@@ -416,7 +484,8 @@ def process_symbol(symbol: str):
 
     # ── Signal Long ──
     if bb_long and ema_long and vol_ok and rsi_long:
-        log.info("%s — Signal LONG : breakout BB + EMA + RSI + volume.", symbol)
+        print(f"  {_C.BG_GREEN}{_C.WHITE}{_C.BOLD} ▲ LONG  {_C.RESET} {symbol} — breakout BB + EMA + RSI + volume")
+        trade_log.info("SIGNAL LONG %s | close=%.2f BB_up=%.2f EMA=%.2f RSI=%.1f vol=%d", symbol, close, bb_upper, ema, rsi, int(tick_vol))
         sl_dist = ATR_SL_MULT * atr_capped
         tp_dist = ATR_TP_MULT * atr_capped
         fill_price = open_order(symbol, "long", sl_dist, tp_dist)
@@ -430,7 +499,8 @@ def process_symbol(symbol: str):
 
     # ── Signal Short ──
     elif bb_short and ema_short and vol_ok and rsi_short:
-        log.info("%s — Signal SHORT : breakdown BB + EMA + RSI + volume.", symbol)
+        print(f"  {_C.BG_RED}{_C.WHITE}{_C.BOLD} ▼ SHORT {_C.RESET} {symbol} — breakdown BB + EMA + RSI + volume")
+        trade_log.info("SIGNAL SHORT %s | close=%.2f BB_lo=%.2f EMA=%.2f RSI=%.1f vol=%d", symbol, close, bb_lower, ema, rsi, int(tick_vol))
         sl_dist = ATR_SL_MULT * atr_capped
         tp_dist = ATR_TP_MULT * atr_capped
         fill_price = open_order(symbol, "short", sl_dist, tp_dist)
@@ -446,31 +516,35 @@ def process_symbol(symbol: str):
     else:
         failed = []
         if not bb_long and not bb_short:
-            failed.append("BB (prix entre les bandes)")
+            failed.append("BB")
         if not vol_ok:
-            failed.append(f"Volume ({int(tick_vol)}/{int(vol_threshold)})")
+            failed.append(f"Vol({int(tick_vol)}/{int(vol_threshold)})")
         if not rsi_long and not rsi_short:
-            failed.append(f"RSI ({rsi:.1f} hors zone)")
+            failed.append(f"RSI({rsi:.1f})")
         if bb_long and not ema_long:
-            failed.append("EMA (prix < EMA, long invalidé)")
+            failed.append("EMA↓")
         if bb_short and not ema_short:
-            failed.append("EMA (prix > EMA, short invalidé)")
-        log.info(
-            "%s — Pas de signal | Conditions manquantes : %s",
-            symbol, " | ".join(failed) if failed else "aucune condition proche",
-        )
+            failed.append("EMA↑")
+        missing = ", ".join(failed) if failed else "aucune condition proche"
+        print(f"  {_C.DIM}  ─ {symbol:<10} pas de signal : {missing}{_C.RESET}")
 
 
 def log_account_status():
     account = mt5.account_info()
     if account is None:
         return
+    pnl = account.profit
+    pnl_color = _C.GREEN if pnl >= 0 else _C.RED
+    print(
+        f"\n{_C.BOLD}{_C.YELLOW}{'─' * 70}\n"
+        f"  COMPTE  │  Solde: {account.balance:>10.2f} $  │  Equity: {account.equity:>10.2f} $\n"
+        f"          │  Marge libre: {account.margin_free:>10.2f} $  │  "
+        f"P&L: {pnl_color}{pnl:>+10.2f} ${_C.RESET}\n"
+        f"{_C.YELLOW}{'─' * 70}{_C.RESET}"
+    )
     log.info(
         "COMPTE | Solde=%.2f $ | Equity=%.2f $ | Marge libre=%.2f $ | P&L flottant=%.2f $",
-        account.balance,
-        account.equity,
-        account.margin_free,
-        account.profit,
+        account.balance, account.equity, account.margin_free, pnl,
     )
 
 
@@ -481,11 +555,18 @@ def main():
     if not connect_mt5():
         return
 
+    print(
+        f"\n{_C.BOLD}{_C.GREEN}"
+        f"╔══════════════════════════════════════════════════════════╗\n"
+        f"║         BREAKOUT BOT v3 — Volatilité MT5               ║\n"
+        f"╚══════════════════════════════════════════════════════════╝{_C.RESET}\n"
+        f"  Symboles : {', '.join(SYMBOLS.values())}\n"
+        f"  Timeframe: M15  │  Risk/Reward: {RISK_REWARD}  │  Scan: {SCAN_INTERVAL}s\n"
+        f"  Session  : {SESSION_START_H}:{SESSION_START_M:02d} — {SESSION_END_H}:{SESSION_END_M:02d} (Paris)\n"
+    )
     log.info(
         "Démarrage du bot v3 — Symboles : %s | TF : M15 | R = %d | Scan toutes les %ds",
-        list(SYMBOLS.values()),
-        RISK_REWARD,
-        SCAN_INTERVAL,
+        list(SYMBOLS.values()), RISK_REWARD, SCAN_INTERVAL,
     )
 
     scan_count = 0
@@ -502,10 +583,11 @@ def main():
 
                 now_paris = datetime.now(PARIS_TZ).strftime("%H:%M:%S")
                 session_ok = in_trading_session()
-                log.info(
-                    "── Scan %s (Paris) — Session US : %s ──",
-                    now_paris,
-                    "OUI" if session_ok else "NON",
+                session_tag = f"{_C.GREEN}● ACTIVE{_C.RESET}" if session_ok else f"{_C.RED}○ FERMÉE{_C.RESET}"
+                print(
+                    f"\n{_C.BOLD}{_C.CYAN}{'═' * 70}\n"
+                    f"  SCAN  {now_paris} (Paris)   │   Session US : {session_tag}\n"
+                    f"{_C.CYAN}{'═' * 70}{_C.RESET}"
                 )
 
                 for symbol in SYMBOLS.values():
