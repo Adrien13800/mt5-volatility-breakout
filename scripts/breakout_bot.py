@@ -101,13 +101,14 @@ _console = logging.StreamHandler()
 _console.setLevel(logging.INFO)
 _console.setFormatter(ColoredFormatter(LOG_FORMAT, datefmt=LOG_DATEFMT))
 
-logging.basicConfig(level=logging.INFO, handlers=[_console])
+logging.basicConfig(level=logging.DEBUG, handlers=[_console])
 log = logging.getLogger("BreakoutBot")
 
 # General log file (all messages)
 _file_all = RotatingFileHandler(
     "breakout_bot.log", maxBytes=5_000_000, backupCount=3, encoding="utf-8"
 )
+_file_all.setLevel(logging.DEBUG)
 _file_all.setFormatter(logging.Formatter(LOG_FORMAT, datefmt=LOG_DATEFMT))
 log.addHandler(_file_all)
 
@@ -413,8 +414,20 @@ def process_symbol(symbol: str):
     vol_threshold = VOL_MULTIPLIER * vol_sma
     pos = get_my_position(symbol)
 
+    # ── Log indicateurs à chaque scan (fichier uniquement) ──
+    candle_time = prev["time"]
+    log.debug(
+        "%s | candle=%s | close=%.2f | BB=[%.2f, %.2f] | EMA=%.2f | RSI=%.1f | ATR=%.2f | vol=%d/%.0f",
+        symbol, candle_time, close, bb_lower, bb_upper, ema, rsi, atr_capped,
+        int(tick_vol), vol_threshold,
+    )
+
     # ── Trailing stop sur position ouverte ──
     if pos is not None:
+        log.info(
+            "%s — position ouverte détectée (ticket=%d, type=%s), signal ignoré.",
+            symbol, pos.ticket, "LONG" if pos.type == mt5.ORDER_TYPE_BUY else "SHORT",
+        )
         tracking = tracked_positions.get(symbol)
         if tracking is None or tracking.get("ticket") != pos.ticket:
             tracked_positions[symbol] = {
@@ -527,6 +540,14 @@ def process_symbol(symbol: str):
             failed.append("EMA↑")
         missing = ", ".join(failed) if failed else "aucune condition proche"
         print(f"  {_C.DIM}  ─ {symbol:<10} pas de signal : {missing}{_C.RESET}")
+
+        log.info(
+            "NO_SIGNAL %s | candle=%s | close=%.2f | BB_lo=%.2f BB_up=%.2f | EMA=%.2f | RSI=%.1f "
+            "| vol=%d/%.0f | conditions: BB_L=%s BB_S=%s EMA_L=%s EMA_S=%s VOL=%s RSI_L=%s RSI_S=%s",
+            symbol, candle_time, close, bb_lower, bb_upper, ema, rsi,
+            int(tick_vol), vol_threshold,
+            bb_long, bb_short, ema_long, ema_short, vol_ok, rsi_long, rsi_short,
+        )
 
 
 def log_account_status():
