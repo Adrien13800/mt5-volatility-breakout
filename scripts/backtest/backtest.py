@@ -34,16 +34,16 @@ EMA_TREND_LENGTH = 50
 RSI_LENGTH = 14
 ATR_LENGTH = 14
 
-RISK_REWARD = 3
+RISK_REWARD = 4  # v5: R:R 4:1 (était 3:1)
 
 ATR_SL_MULT = 1.25  # v4: SL plus serré (était 1.5)
-ATR_TP_MULT = ATR_SL_MULT * RISK_REWARD  # 3.75 ATR
-ATR_TRAIL_ACTIVATE = ATR_TP_MULT * 0.5  # 1.875 ATR (= 1.5R)
-ATR_TRAIL_DIST = 0.75  # v4: trailing plus serré (était ATR_SL_MULT = 1.5)
+ATR_TP_MULT = ATR_SL_MULT * RISK_REWARD  # 5.0 ATR
+ATR_TRAIL_ACTIVATE = ATR_TP_MULT * 0.5  # 2.5 ATR (= 2R)
+ATR_TRAIL_DIST = 0.5  # v5: trailing encore plus serré (était 0.75)
 ATR_MEDIAN_WINDOW = 100
 ATR_CAP_MULT = 1.5
 
-RISK_PCT = 0.02
+RISK_PCT = 0.025  # v5: risk 2.5% (était 2%)
 BACKTEST_MONTHS = 8
 
 SESSION_START_H = 17  # v4: session optimisée (était 15:30)
@@ -255,27 +255,13 @@ def run_backtest(symbols_data: dict) -> list[dict]:
                 lot = pos["lot_size"]
                 usd_per_pt = (specs["tick_value"] / specs["tick_size"]) * point * lot
 
-                if direction == "long":
-                    if low <= pos["sl"]:
-                        pnl_pts = (pos["sl"] - pos["entry_price"]) / point
-                        pnl_usd = round(pnl_pts * usd_per_pt, 2)
-                        equity += pnl_usd
-                        trades.append(
-                            _rec(
-                                symbol,
-                                pos,
-                                t_paris,
-                                pos["sl"],
-                                "SL",
-                                pnl_pts,
-                                pnl_usd,
-                                lot,
-                                equity,
-                            )
-                        )
-                        del positions[symbol]
-                        continue
+                # Ordre réaliste intra-bougie :
+                # 1. TP check (si atteint, on sort — priorité)
+                # 2. Update best_price + trailing (simule le tick-by-tick)
+                # 3. SL check avec le trailing potentiellement resserré
 
+                if direction == "long":
+                    # 1. TP check d'abord
                     if high >= pos["tp"]:
                         pnl_pts = (pos["tp"] - pos["entry_price"]) / point
                         pnl_usd = round(pnl_pts * usd_per_pt, 2)
@@ -296,6 +282,7 @@ def run_backtest(symbols_data: dict) -> list[dict]:
                         del positions[symbol]
                         continue
 
+                    # 2. Update trailing (prix monte au high puis retrace)
                     if high > pos["best_price"]:
                         pos["best_price"] = high
                     profit_dist = pos["best_price"] - pos["entry_price"]
@@ -304,9 +291,9 @@ def run_backtest(symbols_data: dict) -> list[dict]:
                         if new_sl > pos["sl"]:
                             pos["sl"] = new_sl
 
-                else:
-                    if high >= pos["sl"]:
-                        pnl_pts = (pos["entry_price"] - pos["sl"]) / point
+                    # 3. SL check avec trailing resserré
+                    if low <= pos["sl"]:
+                        pnl_pts = (pos["sl"] - pos["entry_price"]) / point
                         pnl_usd = round(pnl_pts * usd_per_pt, 2)
                         equity += pnl_usd
                         trades.append(
@@ -325,6 +312,8 @@ def run_backtest(symbols_data: dict) -> list[dict]:
                         del positions[symbol]
                         continue
 
+                else:
+                    # 1. TP check d'abord
                     if low <= pos["tp"]:
                         pnl_pts = (pos["entry_price"] - pos["tp"]) / point
                         pnl_usd = round(pnl_pts * usd_per_pt, 2)
@@ -345,6 +334,7 @@ def run_backtest(symbols_data: dict) -> list[dict]:
                         del positions[symbol]
                         continue
 
+                    # 2. Update trailing (prix descend au low puis retrace)
                     if low < pos["best_price"]:
                         pos["best_price"] = low
                     profit_dist = pos["entry_price"] - pos["best_price"]
@@ -352,6 +342,27 @@ def run_backtest(symbols_data: dict) -> list[dict]:
                         new_sl = pos["best_price"] + ATR_TRAIL_DIST * atr_e
                         if new_sl < pos["sl"]:
                             pos["sl"] = new_sl
+
+                    # 3. SL check avec trailing resserré
+                    if high >= pos["sl"]:
+                        pnl_pts = (pos["entry_price"] - pos["sl"]) / point
+                        pnl_usd = round(pnl_pts * usd_per_pt, 2)
+                        equity += pnl_usd
+                        trades.append(
+                            _rec(
+                                symbol,
+                                pos,
+                                t_paris,
+                                pos["sl"],
+                                "SL",
+                                pnl_pts,
+                                pnl_usd,
+                                lot,
+                                equity,
+                            )
+                        )
+                        del positions[symbol]
+                        continue
 
                 continue
 

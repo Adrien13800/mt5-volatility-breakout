@@ -36,17 +36,17 @@ EMA_TREND_LENGTH = 50
 RSI_LENGTH = 14
 ATR_LENGTH = 14
 
-RISK_REWARD = 3
+RISK_REWARD = 4  # v5: R:R 4:1 (était 3:1)
 
 ATR_SL_MULT = 1.25  # v4: SL plus serré (était 1.5)
-ATR_TP_MULT = ATR_SL_MULT * RISK_REWARD  # 3.75 ATR
-ATR_TRAIL_ACTIVATE = ATR_TP_MULT * 0.5  # 1.875 ATR (= 1.5R)
-ATR_TRAIL_DIST = 0.75  # v4: trailing plus serré (était ATR_SL_MULT = 1.5)
+ATR_TP_MULT = ATR_SL_MULT * RISK_REWARD  # 5.0 ATR
+ATR_TRAIL_ACTIVATE = ATR_TP_MULT * 0.5  # 2.5 ATR (= 2R)
+ATR_TRAIL_DIST = 0.5  # v5: trailing encore plus serré (était 0.75)
 ATR_MEDIAN_WINDOW = 100
 ATR_CAP_MULT = 1.5
 
 MAGIC_NUMBER = 847291
-RISK_PCT = 0.02
+RISK_PCT = 0.025  # v5: risk 2.5% (était 2%)
 
 SESSION_START_H = 17  # v4: session optimisée (était 15:30)
 SESSION_START_M = 0
