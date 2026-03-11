@@ -1,7 +1,7 @@
 """
-Backtest — Breakout de Volatilité v3
-Lot sizing dynamique (2% risque/trade), multi-symbole bar-par-bar,
-EMA trend filter, ATR-based SL/TP capped, RSI, trailing progressif.
+Backtest — Breakout de Volatilité v4
+Base v3 + SL=1.25 ATR, trailing distance 0.75 ATR,
+session horaire optimisée (17h-21h Paris).
 """
 
 import logging
@@ -25,30 +25,38 @@ SYMBOLS = {
 }
 
 TIMEFRAME = mt5.TIMEFRAME_M15
+H1_TIMEFRAME = mt5.TIMEFRAME_H1
+
 BB_LENGTH = 20
 BB_STD = 2.0
 VOL_SMA_LENGTH = 20
 VOL_MULTIPLIER = 1.3
 
 EMA_TREND_LENGTH = 50
+H1_EMA_LENGTH = 50
 RSI_LENGTH = 14
 ATR_LENGTH = 14
+ADX_LENGTH = 14
+ADX_THRESHOLD = 0  # désactivé (pas d'amélioration en benchmark)
 
 RISK_REWARD = 3
 
-ATR_SL_MULT = 1.25  # v4: SL plus serré (était 1.5)
+ATR_SL_MULT = 1.25  # v4: SL plus serré (v3 = 1.5)
 ATR_TP_MULT = ATR_SL_MULT * RISK_REWARD  # 3.75 ATR
-ATR_TRAIL_ACTIVATE = ATR_TP_MULT * 0.5  # 1.875 ATR (= 1.5R)
-ATR_TRAIL_DIST = 0.75  # v4: trailing plus serré (était ATR_SL_MULT = 1.5)
 ATR_MEDIAN_WINDOW = 100
 ATR_CAP_MULT = 1.5
+
+# Trailing — pas de niveaux progressifs (pas d'amélioration en benchmark)
+TRAIL_LEVELS = []
+TRAIL_TIGHT_ACTIVATE_R = ATR_TP_MULT * 0.5 / ATR_SL_MULT  # 1.5R (= 1.875 ATR)
+TRAIL_TIGHT_DIST = 0.75  # v4: trailing plus serré (v3 = ATR_SL_MULT = 1.5)
 
 RISK_PCT = 0.02
 BACKTEST_MONTHS = 8
 
-SESSION_START_H = 17  # v4: session optimisée (était 15:30)
+SESSION_START_H = 17
 SESSION_START_M = 0
-SESSION_END_H = 21  # v4: (était 22:00)
+SESSION_END_H = 21
 SESSION_END_M = 0
 
 PARIS_TZ = pytz.timezone("Europe/Paris")
@@ -66,7 +74,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)-8s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-log = logging.getLogger("Backtest")
+log = logging.getLogger("Backtest_v4")
 
 # ─────────────────────────── MT5 ─────────────────────────────────────
 
@@ -75,17 +83,19 @@ def connect_mt5() -> bool:
     if not mt5.initialize(login=MT5_LOGIN, password=MT5_PASSWORD, server=MT5_SERVER):
         log.error("Échec d'initialisation MT5 : %s", mt5.last_error())
         return False
-    log.info("MT5 connecté pour backtest — version %s", mt5.version())
+    log.info("MT5 connecté pour backtest v4 — version %s", mt5.version())
     return True
 
 
-def fetch_historical(symbol: str, months: int) -> pd.DataFrame | None:
+def fetch_historical(symbol: str, months: int, timeframe=None) -> pd.DataFrame | None:
+    if timeframe is None:
+        timeframe = TIMEFRAME
     utc_to = datetime.now(tz=pytz.utc)
     utc_from = utc_to - timedelta(days=months * 30)
 
-    rates = mt5.copy_rates_range(symbol, TIMEFRAME, utc_from, utc_to)
+    rates = mt5.copy_rates_range(symbol, timeframe, utc_from, utc_to)
     if rates is None or len(rates) == 0:
-        log.warning("Aucune donnée historique pour %s.", symbol)
+        log.warning("Aucune donnée historique pour %s (tf=%s).", symbol, timeframe)
         return None
 
     df = pd.DataFrame(rates)
@@ -138,7 +148,37 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["atr"] = ta.atr(df["high"], df["low"], df["close"], length=ATR_LENGTH)
     atr_median = df["atr"].rolling(ATR_MEDIAN_WINDOW, min_periods=1).median()
     df["atr_capped"] = df["atr"].clip(upper=atr_median * ATR_CAP_MULT)
+
+    # v4 : ADX
+    adx_df = ta.adx(df["high"], df["low"], df["close"], length=ADX_LENGTH)
+    df["adx"] = adx_df[f"ADX_{ADX_LENGTH}"]
+
     return df
+
+
+def merge_h1_ema(df_m15: pd.DataFrame, df_h1: pd.DataFrame) -> pd.DataFrame:
+    """Mappe chaque barre M15 sur la dernière barre H1 FERMÉE (EMA50 + close)."""
+    df_h1 = df_h1.copy()
+    df_h1["h1_ema50"] = ta.ema(df_h1["close"], length=H1_EMA_LENGTH)
+
+    # Shift H1 time +1h : la donnée d'une barre H1 ouverte à T
+    # n'est disponible qu'après T+1h (quand elle est fermée)
+    h1_for_merge = df_h1[["time", "close", "h1_ema50"]].copy()
+    h1_for_merge["time_avail"] = h1_for_merge["time"] + pd.Timedelta(hours=1)
+    h1_for_merge = h1_for_merge.rename(columns={"close": "h1_close"})
+    h1_for_merge = h1_for_merge.sort_values("time_avail")
+
+    df_m15 = df_m15.sort_values("time")
+
+    merged = pd.merge_asof(
+        df_m15,
+        h1_for_merge[["time_avail", "h1_close", "h1_ema50"]],
+        left_on="time",
+        right_on="time_avail",
+        direction="backward",
+    )
+    merged = merged.drop(columns=["time_avail"])
+    return merged
 
 
 # ─────────────────────────── FILTRE SESSION ──────────────────────────
@@ -186,6 +226,7 @@ def run_backtest(symbols_data: dict) -> list[dict]:
         RSI_LENGTH,
         ATR_LENGTH,
         ATR_MEDIAN_WINDOW,
+        ADX_LENGTH,
     )
 
     for i in range(warmup, n_bars):
@@ -205,10 +246,17 @@ def run_backtest(symbols_data: dict) -> list[dict]:
             ema = row.get("ema_trend")
             rsi = row.get("rsi")
             atr_capped = row.get("atr_capped")
+            adx_val = row.get("adx")
+            h1_close = row.get("h1_close")
+            h1_ema50 = row.get("h1_ema50")
             t_paris = row["time_paris"]
 
             if any(
-                pd.isna(v) for v in (bb_upper, bb_lower, vol_sma, ema, rsi, atr_capped)
+                pd.isna(v)
+                for v in (
+                    bb_upper, bb_lower, vol_sma, ema, rsi,
+                    atr_capped, adx_val,
+                )
             ):
                 pending_signals.pop(symbol, None)
                 continue
@@ -253,105 +301,96 @@ def run_backtest(symbols_data: dict) -> list[dict]:
                 direction = pos["direction"]
                 atr_e = pos["atr_entry"]
                 lot = pos["lot_size"]
+                one_r = ATR_SL_MULT * atr_e
                 usd_per_pt = (specs["tick_value"] / specs["tick_size"]) * point * lot
 
                 if direction == "long":
+                    # SL check
                     if low <= pos["sl"]:
                         pnl_pts = (pos["sl"] - pos["entry_price"]) / point
                         pnl_usd = round(pnl_pts * usd_per_pt, 2)
                         equity += pnl_usd
                         trades.append(
-                            _rec(
-                                symbol,
-                                pos,
-                                t_paris,
-                                pos["sl"],
-                                "SL",
-                                pnl_pts,
-                                pnl_usd,
-                                lot,
-                                equity,
-                            )
+                            _rec(symbol, pos, t_paris, pos["sl"], "SL",
+                                 pnl_pts, pnl_usd, lot, equity)
                         )
                         del positions[symbol]
                         continue
 
+                    # TP check
                     if high >= pos["tp"]:
                         pnl_pts = (pos["tp"] - pos["entry_price"]) / point
                         pnl_usd = round(pnl_pts * usd_per_pt, 2)
                         equity += pnl_usd
                         trades.append(
-                            _rec(
-                                symbol,
-                                pos,
-                                t_paris,
-                                pos["tp"],
-                                "TP",
-                                pnl_pts,
-                                pnl_usd,
-                                lot,
-                                equity,
-                            )
+                            _rec(symbol, pos, t_paris, pos["tp"], "TP",
+                                 pnl_pts, pnl_usd, lot, equity)
                         )
                         del positions[symbol]
                         continue
 
+                    # Trailing progressif
                     if high > pos["best_price"]:
                         pos["best_price"] = high
+
                     profit_dist = pos["best_price"] - pos["entry_price"]
-                    if profit_dist >= ATR_TRAIL_ACTIVATE * atr_e:
-                        new_sl = pos["best_price"] - ATR_TRAIL_DIST * atr_e
+                    profit_r = profit_dist / one_r if one_r > 0 else 0
+
+                    if profit_r >= TRAIL_TIGHT_ACTIVATE_R:
+                        new_sl = pos["best_price"] - TRAIL_TIGHT_DIST * atr_e
                         if new_sl > pos["sl"]:
                             pos["sl"] = new_sl
+                    else:
+                        for threshold_r, lock_r in reversed(TRAIL_LEVELS):
+                            if profit_r >= threshold_r:
+                                new_sl = pos["entry_price"] + lock_r * one_r
+                                if new_sl > pos["sl"]:
+                                    pos["sl"] = new_sl
+                                break
 
-                else:
+                else:  # short
+                    # SL check
                     if high >= pos["sl"]:
                         pnl_pts = (pos["entry_price"] - pos["sl"]) / point
                         pnl_usd = round(pnl_pts * usd_per_pt, 2)
                         equity += pnl_usd
                         trades.append(
-                            _rec(
-                                symbol,
-                                pos,
-                                t_paris,
-                                pos["sl"],
-                                "SL",
-                                pnl_pts,
-                                pnl_usd,
-                                lot,
-                                equity,
-                            )
+                            _rec(symbol, pos, t_paris, pos["sl"], "SL",
+                                 pnl_pts, pnl_usd, lot, equity)
                         )
                         del positions[symbol]
                         continue
 
+                    # TP check
                     if low <= pos["tp"]:
                         pnl_pts = (pos["entry_price"] - pos["tp"]) / point
                         pnl_usd = round(pnl_pts * usd_per_pt, 2)
                         equity += pnl_usd
                         trades.append(
-                            _rec(
-                                symbol,
-                                pos,
-                                t_paris,
-                                pos["tp"],
-                                "TP",
-                                pnl_pts,
-                                pnl_usd,
-                                lot,
-                                equity,
-                            )
+                            _rec(symbol, pos, t_paris, pos["tp"], "TP",
+                                 pnl_pts, pnl_usd, lot, equity)
                         )
                         del positions[symbol]
                         continue
 
+                    # Trailing progressif
                     if low < pos["best_price"]:
                         pos["best_price"] = low
+
                     profit_dist = pos["entry_price"] - pos["best_price"]
-                    if profit_dist >= ATR_TRAIL_ACTIVATE * atr_e:
-                        new_sl = pos["best_price"] + ATR_TRAIL_DIST * atr_e
+                    profit_r = profit_dist / one_r if one_r > 0 else 0
+
+                    if profit_r >= TRAIL_TIGHT_ACTIVATE_R:
+                        new_sl = pos["best_price"] + TRAIL_TIGHT_DIST * atr_e
                         if new_sl < pos["sl"]:
                             pos["sl"] = new_sl
+                    else:
+                        for threshold_r, lock_r in reversed(TRAIL_LEVELS):
+                            if profit_r >= threshold_r:
+                                new_sl = pos["entry_price"] - lock_r * one_r
+                                if new_sl < pos["sl"]:
+                                    pos["sl"] = new_sl
+                                break
 
                 continue
 
@@ -367,6 +406,7 @@ def run_backtest(symbols_data: dict) -> list[dict]:
                 and close > ema
                 and tick_vol > vol_threshold
                 and 50 < rsi < 70
+                and adx_val > ADX_THRESHOLD
             ):
                 pending_signals[symbol] = {
                     "direction": "long",
@@ -379,6 +419,7 @@ def run_backtest(symbols_data: dict) -> list[dict]:
                 and close < ema
                 and tick_vol > vol_threshold
                 and 30 < rsi < 50
+                and adx_val > ADX_THRESHOLD
             ):
                 pending_signals[symbol] = {
                     "direction": "short",
@@ -403,17 +444,8 @@ def run_backtest(symbols_data: dict) -> list[dict]:
         pnl_usd = round(pnl_pts * usd_per_pt, 2)
         equity += pnl_usd
         trades.append(
-            _rec(
-                symbol,
-                pos,
-                last["time_paris"],
-                last["close"],
-                "END",
-                pnl_pts,
-                pnl_usd,
-                lot,
-                equity,
-            )
+            _rec(symbol, pos, last["time_paris"], last["close"], "END",
+                 pnl_pts, pnl_usd, lot, equity)
         )
 
     return trades
@@ -448,11 +480,16 @@ def print_report(all_trades: list[dict]):
     separator = "=" * 80
     log.info(separator)
     log.info(
-        "RAPPORT DE BACKTEST v3 — %d mois | Capital : %.2f $ | Risque : %.0f%%/trade | R = %d",
+        "RAPPORT DE BACKTEST v4 -- %d mois | Capital : %.2f $ | Risque : %.0f%%/trade | R = %d",
         BACKTEST_MONTHS,
         INITIAL_CAPITAL,
         RISK_PCT * 100,
         RISK_REWARD,
+    )
+    log.info(
+        "  Filtres v4 : SL=%.2f ATR | Trail dist=%.2f ATR | Session %02d:%02d-%02d:%02d",
+        ATR_SL_MULT, TRAIL_TIGHT_DIST,
+        SESSION_START_H, SESSION_START_M, SESSION_END_H, SESSION_END_M,
     )
     log.info(separator)
 
@@ -519,9 +556,9 @@ def print_report(all_trades: list[dict]):
     log.info("  Win rate global : %.1f%%", global_wr)
     log.info(separator)
 
-    csv_path = f"backtest_{RISK_REWARD}R.csv"
+    csv_path = f"backtest_v4_{RISK_REWARD}R.csv"
     df.to_csv(csv_path, index=False)
-    log.info("Détail des trades exporté dans : %s", csv_path)
+    log.info("Detail des trades exporte dans : %s", csv_path)
 
 
 # ─────────────────────────── MAIN ────────────────────────────────────
@@ -540,26 +577,39 @@ def main():
             )
 
             if not mt5.symbol_select(symbol, True):
-                log.warning("Symbole %s indisponible, ignoré.", symbol)
+                log.warning("Symbole %s indisponible, ignore.", symbol)
                 continue
 
-            df = fetch_historical(symbol, BACKTEST_MONTHS)
-            if df is None:
+            # Données M15
+            df_m15 = fetch_historical(symbol, BACKTEST_MONTHS, TIMEFRAME)
+            if df_m15 is None:
+                continue
+
+            # Données H1
+            df_h1 = fetch_historical(symbol, BACKTEST_MONTHS, H1_TIMEFRAME)
+            if df_h1 is None:
+                log.warning("Pas de donnees H1 pour %s, ignore.", symbol)
                 continue
 
             log.info(
-                "  %d bougies M15 chargées (%s → %s).",
-                len(df),
-                df["time_paris"].iloc[0].strftime("%Y-%m-%d"),
-                df["time_paris"].iloc[-1].strftime("%Y-%m-%d"),
+                "  %d bougies M15 + %d bougies H1 chargees (%s -> %s).",
+                len(df_m15),
+                len(df_h1),
+                df_m15["time_paris"].iloc[0].strftime("%Y-%m-%d"),
+                df_m15["time_paris"].iloc[-1].strftime("%Y-%m-%d"),
             )
 
-            df = compute_indicators(df)
+            # Indicateurs M15
+            df_m15 = compute_indicators(df_m15)
+
+            # Merge H1 EMA sur M15
+            df_m15 = merge_h1_ema(df_m15, df_h1)
+
             specs = get_symbol_specs(symbol)
-            symbols_data[symbol] = {"df": df, "specs": specs}
+            symbols_data[symbol] = {"df": df_m15, "specs": specs}
 
         if not symbols_data:
-            log.error("Aucun symbole chargé.")
+            log.error("Aucun symbole charge.")
             return
 
         trades = run_backtest(symbols_data)
@@ -570,7 +620,7 @@ def main():
         log.exception("Erreur pendant le backtest : %s", exc)
     finally:
         mt5.shutdown()
-        log.info("MT5 déconnecté.")
+        log.info("MT5 deconnecte.")
 
 
 if __name__ == "__main__":

@@ -1,7 +1,8 @@
 """
-Breakout de Volatilité v3 — Bot MT5 automatisé
-EMA trend filter, ATR-based SL/TP (capped), RSI confirmation,
-Long + Short, trailing progressif.
+Breakout de Volatilité v4 — Bot MT5 automatisé
+Base v3 + SL=1.25 ATR, trailing distance 0.75 ATR,
+session horaire optimisée (17h-21h Paris).
+Aligné 1:1 avec backtest_v4.py.
 """
 
 import logging
@@ -27,33 +28,41 @@ SYMBOLS = {
 }
 
 TIMEFRAME = mt5.TIMEFRAME_M15
+H1_TIMEFRAME = mt5.TIMEFRAME_H1
+
 BB_LENGTH = 20
 BB_STD = 2.0
 VOL_SMA_LENGTH = 20
 VOL_MULTIPLIER = 1.3
 
 EMA_TREND_LENGTH = 50
+H1_EMA_LENGTH = 50
 RSI_LENGTH = 14
 ATR_LENGTH = 14
+ADX_LENGTH = 14
+ADX_THRESHOLD = 0  # désactivé (pas d'amélioration en benchmark)
 
 RISK_REWARD = 3
 
-ATR_SL_MULT = 1.25  # v4: SL plus serré (était 1.5)
+ATR_SL_MULT = 1.25  # v4: SL plus serré (v3 = 1.5)
 ATR_TP_MULT = ATR_SL_MULT * RISK_REWARD  # 3.75 ATR
-ATR_TRAIL_ACTIVATE = ATR_TP_MULT * 0.5  # 1.875 ATR (= 1.5R)
-ATR_TRAIL_DIST = 0.75  # v4: trailing plus serré (était ATR_SL_MULT = 1.5)
 ATR_MEDIAN_WINDOW = 100
 ATR_CAP_MULT = 1.5
 
-MAGIC_NUMBER = 847291
+# Trailing — pas de niveaux progressifs (pas d'amélioration en benchmark)
+TRAIL_LEVELS = []
+TRAIL_TIGHT_ACTIVATE_R = ATR_TP_MULT * 0.5 / ATR_SL_MULT  # 1.5R (= 1.875 ATR)
+TRAIL_TIGHT_DIST = 0.75  # v4: trailing plus serré (v3 = ATR_SL_MULT = 1.5)
+
+MAGIC_NUMBER = 847292  # Différent de v3 (847291) pour éviter les conflits
 RISK_PCT = 0.02
 
-SESSION_START_H = 17  # v4: session optimisée (était 15:30)
+SESSION_START_H = 17
 SESSION_START_M = 0
-SESSION_END_H = 21  # v4: (était 22:00)
+SESSION_END_H = 21
 SESSION_END_M = 0
 
-SCAN_INTERVAL = 7
+SCAN_INTERVAL = 15
 
 MT5_LOGIN = int(os.environ["MT5_LOGIN"])
 MT5_PASSWORD = os.environ["MT5_PASSWORD"]
@@ -102,11 +111,11 @@ _console.setLevel(logging.INFO)
 _console.setFormatter(ColoredFormatter(LOG_FORMAT, datefmt=LOG_DATEFMT))
 
 logging.basicConfig(level=logging.DEBUG, handlers=[_console])
-log = logging.getLogger("BreakoutBot")
+log = logging.getLogger("BreakoutBot_v4")
 
-# General log file (all messages)
+# General log file
 _file_all = RotatingFileHandler(
-    "breakout_bot.log", maxBytes=5_000_000, backupCount=3, encoding="utf-8"
+    "breakout_bot_v4.log", maxBytes=5_000_000, backupCount=3, encoding="utf-8"
 )
 _file_all.setLevel(logging.DEBUG)
 _file_all.setFormatter(logging.Formatter(LOG_FORMAT, datefmt=LOG_DATEFMT))
@@ -115,17 +124,17 @@ log.addHandler(_file_all)
 # Trade-only log file
 _trade_formatter = logging.Formatter("%(asctime)s | %(message)s", datefmt=LOG_DATEFMT)
 _file_trades = RotatingFileHandler(
-    "trades.log", maxBytes=5_000_000, backupCount=5, encoding="utf-8"
+    "trades_v4.log", maxBytes=5_000_000, backupCount=5, encoding="utf-8"
 )
 _file_trades.setFormatter(_trade_formatter)
 _file_trades.setLevel(logging.INFO)
-trade_log = logging.getLogger("BreakoutBot.trades")
+trade_log = logging.getLogger("BreakoutBot_v4.trades")
 trade_log.addHandler(_file_trades)
-trade_log.propagate = False  # don't duplicate into main log
+trade_log.propagate = False
 
 # Error-only log file
 _file_errors = RotatingFileHandler(
-    "errors.log", maxBytes=5_000_000, backupCount=5, encoding="utf-8"
+    "errors_v4.log", maxBytes=5_000_000, backupCount=5, encoding="utf-8"
 )
 _file_errors.setFormatter(logging.Formatter(LOG_FORMAT, datefmt=LOG_DATEFMT))
 _file_errors.setLevel(logging.ERROR)
@@ -134,29 +143,25 @@ log.addHandler(_file_errors)
 # ─────────────────────────── STATE ───────────────────────────────────
 
 tracked_positions: dict[str, dict] = {}
-pending_signals: dict[str, dict] = {}          # signal différé (comme le backtest)
-last_processed_candle: dict[str, object] = {}  # dernière bougie traitée par symbole
+pending_signals: dict[str, dict] = {}
+last_processed_candle: dict[str, object] = {}
 
 # ─────────────────────────── MT5 HELPERS ─────────────────────────────
 
 
 def connect_mt5() -> bool:
     if not mt5.initialize(login=MT5_LOGIN, password=MT5_PASSWORD, server=MT5_SERVER):
-        log.error("Échec d'initialisation MT5 : %s", mt5.last_error())
+        log.error("Echec d'initialisation MT5 : %s", mt5.last_error())
         return False
 
     account = mt5.account_info()
     if account is None:
-        log.error("MT5 initialisé mais account_info() retourne None.")
+        log.error("MT5 initialise mais account_info() retourne None.")
         return False
 
     log.info(
-        "MT5 connecté — compte #%d (%s) | solde=%.2f %s | serveur=%s",
-        account.login,
-        account.name,
-        account.balance,
-        account.currency,
-        account.server,
+        "MT5 connecte -- compte #%d (%s) | solde=%.2f %s | serveur=%s",
+        account.login, account.name, account.balance, account.currency, account.server,
     )
     return True
 
@@ -171,13 +176,13 @@ def ensure_connected() -> bool:
         if connect_mt5():
             return True
         time.sleep(5 * (attempt + 1))
-    log.critical("Impossible de reconnecter MT5 après 3 tentatives.")
+    log.critical("Impossible de reconnecter MT5 apres 3 tentatives.")
     return False
 
 
 def disconnect_mt5():
     mt5.shutdown()
-    log.info("MT5 déconnecté proprement.")
+    log.info("MT5 deconnecte proprement.")
 
 
 def is_symbol_available(symbol: str) -> bool:
@@ -198,7 +203,17 @@ def is_symbol_available(symbol: str) -> bool:
 def get_candles(symbol: str, count: int = 200) -> pd.DataFrame | None:
     rates = mt5.copy_rates_from_pos(symbol, TIMEFRAME, 0, count)
     if rates is None or len(rates) == 0:
-        log.warning("Aucune donnée reçue pour %s.", symbol)
+        log.warning("Aucune donnee recue pour %s.", symbol)
+        return None
+    df = pd.DataFrame(rates)
+    df["time"] = pd.to_datetime(df["time"], unit="s")
+    return df
+
+
+def get_h1_candles(symbol: str, count: int = 100) -> pd.DataFrame | None:
+    rates = mt5.copy_rates_from_pos(symbol, H1_TIMEFRAME, 0, count)
+    if rates is None or len(rates) == 0:
+        log.warning("Aucune donnee H1 recue pour %s.", symbol)
         return None
     df = pd.DataFrame(rates)
     df["time"] = pd.to_datetime(df["time"], unit="s")
@@ -229,6 +244,14 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame | None:
     df["atr"] = atr
     atr_median = df["atr"].rolling(ATR_MEDIAN_WINDOW, min_periods=1).median()
     df["atr_capped"] = df["atr"].clip(upper=atr_median * ATR_CAP_MULT)
+
+    # v4 : ADX
+    adx_df = ta.adx(df["high"], df["low"], df["close"], length=ADX_LENGTH)
+    if adx_df is not None:
+        df["adx"] = adx_df[f"ADX_{ADX_LENGTH}"]
+    else:
+        df["adx"] = float("nan")
+
     return df
 
 
@@ -256,7 +279,7 @@ def get_my_position(symbol: str):
     matches = [p for p in positions if p.magic == MAGIC_NUMBER]
     if len(matches) > 1:
         log.warning(
-            "%s — %d positions avec magic %d détectées, gestion de la première.",
+            "%s -- %d positions avec magic %d detectees, gestion de la premiere.",
             symbol, len(matches), MAGIC_NUMBER,
         )
     return matches[0] if matches else None
@@ -283,14 +306,13 @@ def calculate_lot_size(symbol: str, sl_dist: float) -> float | None:
 
 
 def open_order(symbol: str, direction: str, sl_dist: float, tp_dist: float) -> float | None:
-    """Ouvre un ordre avec lot sizing dynamique. Retourne le prix de fill ou None."""
     info = mt5.symbol_info(symbol)
     if info is None:
         return None
 
     tick = mt5.symbol_info_tick(symbol)
     if tick is None:
-        log.error("Tick indisponible pour %s, ordre annulé.", symbol)
+        log.error("Tick indisponible pour %s, ordre annule.", symbol)
         return None
 
     lot_size = calculate_lot_size(symbol, sl_dist)
@@ -303,13 +325,13 @@ def open_order(symbol: str, direction: str, sl_dist: float, tp_dist: float) -> f
         order_type = mt5.ORDER_TYPE_BUY
         sl = round(price - sl_dist, info.digits)
         tp = round(price + tp_dist, info.digits)
-        comment = "Breakout Bot — Long"
+        comment = "Breakout v4 -- Long"
     else:
         price = tick.bid
         order_type = mt5.ORDER_TYPE_SELL
         sl = round(price + sl_dist, info.digits)
         tp = round(price - tp_dist, info.digits)
-        comment = "Breakout Bot — Short"
+        comment = "Breakout v4 -- Short"
 
     request = {
         "action": mt5.TRADE_ACTION_DEAL,
@@ -330,7 +352,7 @@ def open_order(symbol: str, direction: str, sl_dist: float, tp_dist: float) -> f
         retcode = result.retcode if result else "None"
         comment = result.comment if result else "no response"
         log.error(
-            "Ordre %s échoué sur %s | retcode=%s | %s",
+            "Ordre %s echoue sur %s | retcode=%s | %s",
             direction.upper(), symbol, retcode, comment,
         )
         return None
@@ -364,7 +386,7 @@ def modify_sl(symbol: str, ticket: int, new_sl: float, current_tp: float) -> boo
     }
     result = mt5.order_send(request)
     if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
-        log.error("Modification SL échouée ticket %d : %s", ticket, result)
+        log.error("Modification SL echouee ticket %d : %s", ticket, result)
         return False
 
     log.info(
@@ -382,17 +404,18 @@ def process_symbol(symbol: str):
     if not is_symbol_available(symbol):
         return
 
+    # ── Données M15 ──
     df = get_candles(symbol)
     if df is None:
         return
 
     df = compute_indicators(df)
     if df is None:
-        log.warning("%s — échec calcul indicateurs.", symbol)
+        log.warning("%s -- echec calcul indicateurs.", symbol)
         return
 
     if len(df) < 2:
-        log.warning("%s — pas assez de bougies.", symbol)
+        log.warning("%s -- pas assez de bougies.", symbol)
         return
 
     prev = df.iloc[-2]
@@ -405,31 +428,35 @@ def process_symbol(symbol: str):
     ema = prev.get("ema_trend")
     rsi = prev.get("rsi")
     atr_capped = prev.get("atr_capped")
+    adx_val = prev.get("adx")
 
-    if any(pd.isna(v) for v in (bb_upper, bb_lower, vol_sma, ema, rsi, atr_capped)):
-        pending_signals.pop(symbol, None)  # annuler pending (comme le backtest)
-        log.warning("%s — indicateurs non calculés (données insuffisantes).", symbol)
+    if any(pd.isna(v) for v in (
+        bb_upper, bb_lower, vol_sma, ema, rsi,
+        atr_capped, adx_val,
+    )):
+        pending_signals.pop(symbol, None)
+        log.warning("%s -- indicateurs non calcules (donnees insuffisantes).", symbol)
         return
 
     if atr_capped == 0:
-        pending_signals.pop(symbol, None)  # annuler pending (comme le backtest)
+        pending_signals.pop(symbol, None)
         return
 
     vol_threshold = VOL_MULTIPLIER * vol_sma
     pos = get_my_position(symbol)
 
-    # ── Log indicateurs à chaque scan (fichier uniquement) ──
     candle_time = prev["time"]
     log.debug(
-        "%s | candle=%s | close=%.2f | BB=[%.2f, %.2f] | EMA=%.2f | RSI=%.1f | ATR=%.2f | vol=%d/%.0f",
-        symbol, candle_time, close, bb_lower, bb_upper, ema, rsi, atr_capped,
-        int(tick_vol), vol_threshold,
+        "%s | candle=%s | close=%.2f | BB=[%.2f, %.2f] | EMA=%.2f | RSI=%.1f "
+        "| ATR=%.2f | ADX=%.1f | vol=%d/%.0f",
+        symbol, candle_time, close, bb_lower, bb_upper, ema, rsi,
+        atr_capped, adx_val, int(tick_vol), vol_threshold,
     )
 
-    # ── Trailing stop sur position ouverte (tourne à chaque scan) ──
+    # ── Trailing stop progressif (tourne à chaque scan) ──
     if pos is not None:
         log.info(
-            "%s — position ouverte détectée (ticket=%d, type=%s), signal ignoré.",
+            "%s -- position ouverte (ticket=%d, type=%s), signal ignore.",
             symbol, pos.ticket, "LONG" if pos.type == mt5.ORDER_TYPE_BUY else "SHORT",
         )
         tracking = tracked_positions.get(symbol)
@@ -443,10 +470,11 @@ def process_symbol(symbol: str):
 
         tick = mt5.symbol_info_tick(symbol)
         if tick is None:
-            log.warning("Tick indisponible pour %s, trailing ignoré.", symbol)
+            log.warning("Tick indisponible pour %s, trailing ignore.", symbol)
             return
 
         atr_e = tracking["atr_entry"]
+        one_r = ATR_SL_MULT * atr_e
         is_long = pos.type == mt5.ORDER_TYPE_BUY
 
         if is_long:
@@ -455,42 +483,55 @@ def process_symbol(symbol: str):
                 tracking["best_price"] = current_price
 
             profit_dist = tracking["best_price"] - pos.price_open
-            if profit_dist >= ATR_TRAIL_ACTIVATE * atr_e:
-                new_sl = tracking["best_price"] - ATR_TRAIL_DIST * atr_e
+            profit_r = profit_dist / one_r if one_r > 0 else 0
+
+            if profit_r >= TRAIL_TIGHT_ACTIVATE_R:
+                new_sl = tracking["best_price"] - TRAIL_TIGHT_DIST * atr_e
                 if new_sl > pos.sl:
                     modify_sl(symbol, pos.ticket, new_sl, pos.tp)
+            else:
+                for threshold_r, lock_r in reversed(TRAIL_LEVELS):
+                    if profit_r >= threshold_r:
+                        new_sl = pos.price_open + lock_r * one_r
+                        if new_sl > pos.sl:
+                            modify_sl(symbol, pos.ticket, new_sl, pos.tp)
+                        break
         else:
             current_price = tick.ask
             if current_price < tracking["best_price"]:
                 tracking["best_price"] = current_price
 
             profit_dist = pos.price_open - tracking["best_price"]
-            if profit_dist >= ATR_TRAIL_ACTIVATE * atr_e:
-                new_sl = tracking["best_price"] + ATR_TRAIL_DIST * atr_e
+            profit_r = profit_dist / one_r if one_r > 0 else 0
+
+            if profit_r >= TRAIL_TIGHT_ACTIVATE_R:
+                new_sl = tracking["best_price"] + TRAIL_TIGHT_DIST * atr_e
                 if new_sl < pos.sl:
                     modify_sl(symbol, pos.ticket, new_sl, pos.tp)
+            else:
+                for threshold_r, lock_r in reversed(TRAIL_LEVELS):
+                    if profit_r >= threshold_r:
+                        new_sl = pos.price_open - lock_r * one_r
+                        if new_sl < pos.sl:
+                            modify_sl(symbol, pos.ticket, new_sl, pos.tp)
+                        break
 
         return
 
     tracked_positions.pop(symbol, None)
 
     # ── Détection transition de bougie ──
-    # Comme le backtest : on ne traite chaque bougie qu'une seule fois.
-    # Entre les transitions, aucune action (pas de re-signal, pas de re-entrée).
     if candle_time == last_processed_candle.get(symbol):
         return
     last_processed_candle[symbol] = candle_time
 
-    # ── Exécution signal différé (entrée bougie suivante, comme le backtest) ──
-    # Backtest : signal sur bar[i], entrée à l'open de bar[i+1]
-    # Production : signal sur prev (bougie fermée), entrée au market quand
-    #              prev change (= nouvelle bougie vient de s'ouvrir, prix ≈ open)
+    # ── Exécution signal différé (comme le backtest) ──
     if symbol in pending_signals:
         sig = pending_signals.pop(symbol)
         sl_dist = ATR_SL_MULT * sig["atr_capped"]
         tp_dist = ATR_TP_MULT * sig["atr_capped"]
         log.info(
-            "%s%s — EXECUTION signal différé %s (signal bougie=%s)%s",
+            "%s%s -- EXECUTION signal differe %s (signal bougie=%s)%s",
             _C.BOLD, symbol, sig["direction"].upper(), sig.get("signal_time", "?"), _C.RESET,
         )
         trade_log.info(
@@ -505,23 +546,23 @@ def process_symbol(symbol: str):
                 "best_price": fill_price,
                 "atr_entry": sig["atr_capped"],
             }
-        # Skip signal detection sur la bougie d'entrée (comme le `continue` du backtest)
         return
 
-    # ── Filtre session américaine ──
+    # ── Filtre session ──
     if not in_trading_session():
         return
 
-    vol_icon = f"{_C.GREEN}✓{_C.RESET}" if tick_vol > vol_threshold else f"{_C.RED}✗{_C.RESET}"
+    vol_icon = f"{_C.GREEN}v{_C.RESET}" if tick_vol > vol_threshold else f"{_C.RED}x{_C.RESET}"
     rsi_color = _C.GREEN if 50 < rsi < 70 else (_C.RED if 30 < rsi < 50 else _C.YELLOW)
     print(
         f"  {_C.BOLD}{symbol:<10}{_C.RESET}"
         f"  close {_C.WHITE}{close:>10.2f}{_C.RESET}"
-        f"  │ BB [{bb_lower:.2f} — {bb_upper:.2f}]"
-        f"  │ EMA {ema:.2f}"
-        f"  │ RSI {rsi_color}{rsi:5.1f}{_C.RESET}"
-        f"  │ ATR {atr_capped:.2f}"
-        f"  │ vol {int(tick_vol):>5}/{int(vol_threshold):<5} {vol_icon}"
+        f"  | BB [{bb_lower:.2f} - {bb_upper:.2f}]"
+        f"  | EMA {ema:.2f}"
+        f"  | RSI {rsi_color}{rsi:5.1f}{_C.RESET}"
+        f"  | ATR {atr_capped:.2f}"
+        f"  | ADX {adx_val:.1f}"
+        f"  | vol {int(tick_vol):>5}/{int(vol_threshold):<5} {vol_icon}"
     )
 
     # ── Conditions individuelles ──
@@ -532,33 +573,40 @@ def process_symbol(symbol: str):
     vol_ok = tick_vol > vol_threshold
     rsi_long = 50 < rsi < 70
     rsi_short = 30 < rsi < 50
+    adx_ok = adx_val > ADX_THRESHOLD
 
-    # ── Signal Long (différé → exécution à la prochaine bougie) ──
-    if bb_long and ema_long and vol_ok and rsi_long:
-        print(f"  {_C.BG_GREEN}{_C.WHITE}{_C.BOLD} ▲ LONG PENDING {_C.RESET} {symbol} — breakout BB + EMA + RSI + volume (entrée prochaine bougie)")
-        trade_log.info("SIGNAL LONG (PENDING) %s | close=%.2f BB_up=%.2f EMA=%.2f RSI=%.1f vol=%d", symbol, close, bb_upper, ema, rsi, int(tick_vol))
+    # ── Signal Long (différé) ──
+    if bb_long and ema_long and vol_ok and rsi_long and adx_ok:
+        print(f"  {_C.BG_GREEN}{_C.WHITE}{_C.BOLD} ^ LONG PENDING {_C.RESET} {symbol} (entree prochaine bougie)")
+        trade_log.info(
+            "SIGNAL LONG (PENDING) %s | close=%.2f BB_up=%.2f EMA=%.2f RSI=%.1f ADX=%.1f vol=%d",
+            symbol, close, bb_upper, ema, rsi, adx_val, int(tick_vol),
+        )
         pending_signals[symbol] = {
             "direction": "long",
             "atr_capped": atr_capped,
             "signal_time": str(candle_time),
         }
 
-    # ── Signal Short (différé → exécution à la prochaine bougie) ──
-    elif bb_short and ema_short and vol_ok and rsi_short:
-        print(f"  {_C.BG_RED}{_C.WHITE}{_C.BOLD} ▼ SHORT PENDING {_C.RESET} {symbol} — breakdown BB + EMA + RSI + volume (entrée prochaine bougie)")
-        trade_log.info("SIGNAL SHORT (PENDING) %s | close=%.2f BB_lo=%.2f EMA=%.2f RSI=%.1f vol=%d", symbol, close, bb_lower, ema, rsi, int(tick_vol))
+    # ── Signal Short (différé) ──
+    elif bb_short and ema_short and vol_ok and rsi_short and adx_ok:
+        print(f"  {_C.BG_RED}{_C.WHITE}{_C.BOLD} v SHORT PENDING {_C.RESET} {symbol} (entree prochaine bougie)")
+        trade_log.info(
+            "SIGNAL SHORT (PENDING) %s | close=%.2f BB_lo=%.2f EMA=%.2f RSI=%.1f ADX=%.1f vol=%d",
+            symbol, close, bb_lower, ema, rsi, adx_val, int(tick_vol),
+        )
         pending_signals[symbol] = {
             "direction": "short",
             "atr_capped": atr_capped,
             "signal_time": str(candle_time),
         }
 
-    # ── Aucun signal → annuler tout pending (comme le backtest) ──
+    # ── Aucun signal → annuler pending ──
     else:
         cancelled = pending_signals.pop(symbol, None)
         if cancelled:
             log.info(
-                "%s — signal %s annulé (conditions plus remplies sur bougie %s)",
+                "%s -- signal %s annule (conditions plus remplies sur bougie %s)",
                 symbol, cancelled["direction"].upper(), candle_time,
             )
             trade_log.info(
@@ -573,19 +621,20 @@ def process_symbol(symbol: str):
             failed.append(f"Vol({int(tick_vol)}/{int(vol_threshold)})")
         if not rsi_long and not rsi_short:
             failed.append(f"RSI({rsi:.1f})")
+        if not adx_ok:
+            failed.append(f"ADX({adx_val:.1f}<{ADX_THRESHOLD})")
         if bb_long and not ema_long:
-            failed.append("EMA↓")
+            failed.append("EMA_dn")
         if bb_short and not ema_short:
-            failed.append("EMA↑")
+            failed.append("EMA_up")
         missing = ", ".join(failed) if failed else "aucune condition proche"
-        print(f"  {_C.DIM}  ─ {symbol:<10} pas de signal : {missing}{_C.RESET}")
+        print(f"  {_C.DIM}  - {symbol:<10} pas de signal : {missing}{_C.RESET}")
 
         log.info(
-            "NO_SIGNAL %s | candle=%s | close=%.2f | BB_lo=%.2f BB_up=%.2f | EMA=%.2f | RSI=%.1f "
-            "| vol=%d/%.0f | conditions: BB_L=%s BB_S=%s EMA_L=%s EMA_S=%s VOL=%s RSI_L=%s RSI_S=%s",
+            "NO_SIGNAL %s | candle=%s | close=%.2f | BB=[%.2f,%.2f] | EMA=%.2f | RSI=%.1f "
+            "| ADX=%.1f | vol=%d/%.0f",
             symbol, candle_time, close, bb_lower, bb_upper, ema, rsi,
-            int(tick_vol), vol_threshold,
-            bb_long, bb_short, ema_long, ema_short, vol_ok, rsi_long, rsi_short,
+            adx_val, int(tick_vol), vol_threshold,
         )
 
 
@@ -596,14 +645,14 @@ def log_account_status():
     pnl = account.profit
     pnl_color = _C.GREEN if pnl >= 0 else _C.RED
     print(
-        f"\n{_C.BOLD}{_C.YELLOW}{'─' * 70}\n"
-        f"  COMPTE  │  Solde: {account.balance:>10.2f} $  │  Equity: {account.equity:>10.2f} $\n"
-        f"          │  Marge libre: {account.margin_free:>10.2f} $  │  "
+        f"\n{_C.BOLD}{_C.YELLOW}{'_' * 70}\n"
+        f"  COMPTE  |  Solde: {account.balance:>10.2f} $  |  Equity: {account.equity:>10.2f} $\n"
+        f"          |  Marge libre: {account.margin_free:>10.2f} $  |  "
         f"P&L: {pnl_color}{pnl:>+10.2f} ${_C.RESET}\n"
-        f"{_C.YELLOW}{'─' * 70}{_C.RESET}"
+        f"{_C.YELLOW}{'_' * 70}{_C.RESET}"
     )
     log.info(
-        "COMPTE | Solde=%.2f $ | Equity=%.2f $ | Marge libre=%.2f $ | P&L flottant=%.2f $",
+        "COMPTE | Solde=%.2f $ | Equity=%.2f $ | Marge libre=%.2f $ | P&L=%.2f $",
         account.balance, account.equity, account.margin_free, pnl,
     )
 
@@ -617,16 +666,18 @@ def main():
 
     print(
         f"\n{_C.BOLD}{_C.GREEN}"
-        f"╔══════════════════════════════════════════════════════════╗\n"
-        f"║         BREAKOUT BOT v3 — Volatilité MT5               ║\n"
-        f"╚══════════════════════════════════════════════════════════╝{_C.RESET}\n"
+        f"+========================================================+\n"
+        f"|         BREAKOUT BOT v4 -- Volatilite MT5              |\n"
+        f"+========================================================+{_C.RESET}\n"
         f"  Symboles : {', '.join(SYMBOLS.values())}\n"
-        f"  Timeframe: M15  │  Risk/Reward: {RISK_REWARD}  │  Scan: {SCAN_INTERVAL}s\n"
-        f"  Session  : {SESSION_START_H}:{SESSION_START_M:02d} — {SESSION_END_H}:{SESSION_END_M:02d} (Paris)\n"
+        f"  Timeframe: M15 + H1 EMA  |  R/R: {RISK_REWARD}  |  Scan: {SCAN_INTERVAL}s\n"
+        f"  Session  : {SESSION_START_H}:{SESSION_START_M:02d} -- {SESSION_END_H}:{SESSION_END_M:02d} (Paris)\n"
+        f"  Filtres  : ADX>{ADX_THRESHOLD} | Trail tight dist={TRAIL_TIGHT_DIST} ATR\n"
     )
     log.info(
-        "Démarrage du bot v3 — Symboles : %s | TF : M15 | R = %d | Scan toutes les %ds",
-        list(SYMBOLS.values()), RISK_REWARD, SCAN_INTERVAL,
+        "Demarrage bot v4 -- Symboles : %s | TF : M15+H1 | R=%d | Scan %ds | ADX>%d | Session %02d:%02d-%02d:%02d",
+        list(SYMBOLS.values()), RISK_REWARD, SCAN_INTERVAL, ADX_THRESHOLD,
+        SESSION_START_H, SESSION_START_M, SESSION_END_H, SESSION_END_M,
     )
 
     scan_count = 0
@@ -643,11 +694,11 @@ def main():
 
                 now_paris = datetime.now(PARIS_TZ).strftime("%H:%M:%S")
                 session_ok = in_trading_session()
-                session_tag = f"{_C.GREEN}● ACTIVE{_C.RESET}" if session_ok else f"{_C.RED}○ FERMÉE{_C.RESET}"
+                session_tag = f"{_C.GREEN}* ACTIVE{_C.RESET}" if session_ok else f"{_C.RED}o FERMEE{_C.RESET}"
                 print(
-                    f"\n{_C.BOLD}{_C.CYAN}{'═' * 70}\n"
-                    f"  SCAN  {now_paris} (Paris)   │   Session US : {session_tag}\n"
-                    f"{_C.CYAN}{'═' * 70}{_C.RESET}"
+                    f"\n{_C.BOLD}{_C.CYAN}{'=' * 70}\n"
+                    f"  SCAN v4  {now_paris} (Paris)   |   Session : {session_tag}\n"
+                    f"{_C.CYAN}{'=' * 70}{_C.RESET}"
                 )
 
                 for symbol in SYMBOLS.values():
@@ -667,7 +718,7 @@ def main():
             time.sleep(max(0, SCAN_INTERVAL - elapsed))
 
     except KeyboardInterrupt:
-        log.info("Arrêt demandé par l'utilisateur (Ctrl+C).")
+        log.info("Arret demande par l'utilisateur (Ctrl+C).")
     finally:
         disconnect_mt5()
 
