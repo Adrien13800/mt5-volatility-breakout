@@ -1,5 +1,5 @@
 """
-Breakout de Volatilité v3 — Bot MT5 automatisé
+Breakout de Volatilité v5 — Bot MT5 automatisé
 EMA trend filter, ATR-based SL/TP (capped), RSI confirmation,
 Long + Short, trailing progressif.
 """
@@ -36,17 +36,18 @@ EMA_TREND_LENGTH = 50
 RSI_LENGTH = 14
 ATR_LENGTH = 14
 
-RISK_REWARD = 4  # v5: R:R 4:1 (était 3:1)
+RISK_REWARD = 4
 
-ATR_SL_MULT = 1.25  # v4: SL plus serré (était 1.5)
-ATR_TP_MULT = ATR_SL_MULT * RISK_REWARD  # 5.0 ATR
-ATR_TRAIL_ACTIVATE = ATR_TP_MULT * 0.5  # 2.5 ATR (= 2R)
-ATR_TRAIL_DIST = 0.5  # v5: trailing encore plus serré (était 0.75)
+ATR_SL_MULT = 0.75  # v6: SL serré (était 1.25)
+ATR_TP_MULT = ATR_SL_MULT * RISK_REWARD  # 3.0 ATR
+TRAIL_ACTIVATE_R = 1.5  # v6: activation trailing à 1.5R (était 2R)
+ATR_TRAIL_ACTIVATE = TRAIL_ACTIVATE_R * ATR_SL_MULT  # 1.125 ATR
+ATR_TRAIL_DIST = 0.3  # v6: trailing serré (était 0.5)
 ATR_MEDIAN_WINDOW = 100
 ATR_CAP_MULT = 1.5
 
 MAGIC_NUMBER = 847291
-RISK_PCT = 0.025  # v5: risk 2.5% (était 2%)
+RISK_PCT = 0.03  # v6: risk 3% (était 2.5%)
 
 SESSION_START_H = 17  # v4: session optimisée (était 15:30)
 SESSION_START_M = 0
@@ -618,14 +619,14 @@ def main():
     print(
         f"\n{_C.BOLD}{_C.GREEN}"
         f"╔══════════════════════════════════════════════════════════╗\n"
-        f"║         BREAKOUT BOT v3 — Volatilité MT5               ║\n"
+        f"║         BREAKOUT BOT v5 — Volatilité MT5               ║\n"
         f"╚══════════════════════════════════════════════════════════╝{_C.RESET}\n"
         f"  Symboles : {', '.join(SYMBOLS.values())}\n"
         f"  Timeframe: M15  │  Risk/Reward: {RISK_REWARD}  │  Scan: {SCAN_INTERVAL}s\n"
         f"  Session  : {SESSION_START_H}:{SESSION_START_M:02d} — {SESSION_END_H}:{SESSION_END_M:02d} (Paris)\n"
     )
     log.info(
-        "Démarrage du bot v3 — Symboles : %s | TF : M15 | R = %d | Scan toutes les %ds",
+        "Démarrage du bot v5 — Symboles : %s | TF : M15 | R = %d | Scan toutes les %ds",
         list(SYMBOLS.values()), RISK_REWARD, SCAN_INTERVAL,
     )
 
