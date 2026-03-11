@@ -134,6 +134,8 @@ log.addHandler(_file_errors)
 # ─────────────────────────── STATE ───────────────────────────────────
 
 tracked_positions: dict[str, dict] = {}
+pending_signals: dict[str, dict] = {}          # signal différé (comme le backtest)
+last_processed_candle: dict[str, object] = {}  # dernière bougie traitée par symbole
 
 # ─────────────────────────── MT5 HELPERS ─────────────────────────────
 
@@ -405,10 +407,12 @@ def process_symbol(symbol: str):
     atr_capped = prev.get("atr_capped")
 
     if any(pd.isna(v) for v in (bb_upper, bb_lower, vol_sma, ema, rsi, atr_capped)):
+        pending_signals.pop(symbol, None)  # annuler pending (comme le backtest)
         log.warning("%s — indicateurs non calculés (données insuffisantes).", symbol)
         return
 
     if atr_capped == 0:
+        pending_signals.pop(symbol, None)  # annuler pending (comme le backtest)
         return
 
     vol_threshold = VOL_MULTIPLIER * vol_sma
@@ -422,7 +426,7 @@ def process_symbol(symbol: str):
         int(tick_vol), vol_threshold,
     )
 
-    # ── Trailing stop sur position ouverte ──
+    # ── Trailing stop sur position ouverte (tourne à chaque scan) ──
     if pos is not None:
         log.info(
             "%s — position ouverte détectée (ticket=%d, type=%s), signal ignoré.",
@@ -470,6 +474,40 @@ def process_symbol(symbol: str):
 
     tracked_positions.pop(symbol, None)
 
+    # ── Détection transition de bougie ──
+    # Comme le backtest : on ne traite chaque bougie qu'une seule fois.
+    # Entre les transitions, aucune action (pas de re-signal, pas de re-entrée).
+    if candle_time == last_processed_candle.get(symbol):
+        return
+    last_processed_candle[symbol] = candle_time
+
+    # ── Exécution signal différé (entrée bougie suivante, comme le backtest) ──
+    # Backtest : signal sur bar[i], entrée à l'open de bar[i+1]
+    # Production : signal sur prev (bougie fermée), entrée au market quand
+    #              prev change (= nouvelle bougie vient de s'ouvrir, prix ≈ open)
+    if symbol in pending_signals:
+        sig = pending_signals.pop(symbol)
+        sl_dist = ATR_SL_MULT * sig["atr_capped"]
+        tp_dist = ATR_TP_MULT * sig["atr_capped"]
+        log.info(
+            "%s%s — EXECUTION signal différé %s (signal bougie=%s)%s",
+            _C.BOLD, symbol, sig["direction"].upper(), sig.get("signal_time", "?"), _C.RESET,
+        )
+        trade_log.info(
+            "EXEC DEFERRED %s %s | atr_capped=%.2f | signal_candle=%s",
+            sig["direction"].upper(), symbol, sig["atr_capped"], sig.get("signal_time", "?"),
+        )
+        fill_price = open_order(symbol, sig["direction"], sl_dist, tp_dist)
+        if fill_price is not None:
+            new_pos = get_my_position(symbol)
+            tracked_positions[symbol] = {
+                "ticket": new_pos.ticket if new_pos else 0,
+                "best_price": fill_price,
+                "atr_entry": sig["atr_capped"],
+            }
+        # Skip signal detection sur la bougie d'entrée (comme le `continue` du backtest)
+        return
+
     # ── Filtre session américaine ──
     if not in_trading_session():
         return
@@ -495,38 +533,39 @@ def process_symbol(symbol: str):
     rsi_long = 50 < rsi < 70
     rsi_short = 30 < rsi < 50
 
-    # ── Signal Long ──
+    # ── Signal Long (différé → exécution à la prochaine bougie) ──
     if bb_long and ema_long and vol_ok and rsi_long:
-        print(f"  {_C.BG_GREEN}{_C.WHITE}{_C.BOLD} ▲ LONG  {_C.RESET} {symbol} — breakout BB + EMA + RSI + volume")
-        trade_log.info("SIGNAL LONG %s | close=%.2f BB_up=%.2f EMA=%.2f RSI=%.1f vol=%d", symbol, close, bb_upper, ema, rsi, int(tick_vol))
-        sl_dist = ATR_SL_MULT * atr_capped
-        tp_dist = ATR_TP_MULT * atr_capped
-        fill_price = open_order(symbol, "long", sl_dist, tp_dist)
-        if fill_price is not None:
-            new_pos = get_my_position(symbol)
-            tracked_positions[symbol] = {
-                "ticket": new_pos.ticket if new_pos else 0,
-                "best_price": fill_price,
-                "atr_entry": atr_capped,
-            }
+        print(f"  {_C.BG_GREEN}{_C.WHITE}{_C.BOLD} ▲ LONG PENDING {_C.RESET} {symbol} — breakout BB + EMA + RSI + volume (entrée prochaine bougie)")
+        trade_log.info("SIGNAL LONG (PENDING) %s | close=%.2f BB_up=%.2f EMA=%.2f RSI=%.1f vol=%d", symbol, close, bb_upper, ema, rsi, int(tick_vol))
+        pending_signals[symbol] = {
+            "direction": "long",
+            "atr_capped": atr_capped,
+            "signal_time": str(candle_time),
+        }
 
-    # ── Signal Short ──
+    # ── Signal Short (différé → exécution à la prochaine bougie) ──
     elif bb_short and ema_short and vol_ok and rsi_short:
-        print(f"  {_C.BG_RED}{_C.WHITE}{_C.BOLD} ▼ SHORT {_C.RESET} {symbol} — breakdown BB + EMA + RSI + volume")
-        trade_log.info("SIGNAL SHORT %s | close=%.2f BB_lo=%.2f EMA=%.2f RSI=%.1f vol=%d", symbol, close, bb_lower, ema, rsi, int(tick_vol))
-        sl_dist = ATR_SL_MULT * atr_capped
-        tp_dist = ATR_TP_MULT * atr_capped
-        fill_price = open_order(symbol, "short", sl_dist, tp_dist)
-        if fill_price is not None:
-            new_pos = get_my_position(symbol)
-            tracked_positions[symbol] = {
-                "ticket": new_pos.ticket if new_pos else 0,
-                "best_price": fill_price,
-                "atr_entry": atr_capped,
-            }
+        print(f"  {_C.BG_RED}{_C.WHITE}{_C.BOLD} ▼ SHORT PENDING {_C.RESET} {symbol} — breakdown BB + EMA + RSI + volume (entrée prochaine bougie)")
+        trade_log.info("SIGNAL SHORT (PENDING) %s | close=%.2f BB_lo=%.2f EMA=%.2f RSI=%.1f vol=%d", symbol, close, bb_lower, ema, rsi, int(tick_vol))
+        pending_signals[symbol] = {
+            "direction": "short",
+            "atr_capped": atr_capped,
+            "signal_time": str(candle_time),
+        }
 
-    # ── Aucun signal — détail des conditions ──
+    # ── Aucun signal → annuler tout pending (comme le backtest) ──
     else:
+        cancelled = pending_signals.pop(symbol, None)
+        if cancelled:
+            log.info(
+                "%s — signal %s annulé (conditions plus remplies sur bougie %s)",
+                symbol, cancelled["direction"].upper(), candle_time,
+            )
+            trade_log.info(
+                "CANCELLED %s %s | conditions no longer met on candle %s",
+                cancelled["direction"].upper(), symbol, candle_time,
+            )
+
         failed = []
         if not bb_long and not bb_short:
             failed.append("BB")
