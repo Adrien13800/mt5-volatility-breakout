@@ -626,14 +626,14 @@ def main():
     print(
         f"\n{_C.BOLD}{_C.GREEN}"
         f"╔══════════════════════════════════════════════════════════╗\n"
-        f"║         BREAKOUT BOT v6 — Volatilité MT5               ║\n"
+        f"║         BREAKOUT BOT v7 — Volatilité MT5               ║\n"
         f"╚══════════════════════════════════════════════════════════╝{_C.RESET}\n"
         f"  Symboles : {', '.join(SYMBOLS.values())}\n"
         f"  Timeframe: M15  │  Risk/Reward: {RISK_REWARD}  │  Scan: {SCAN_INTERVAL}s\n"
         f"  Session  : {SESSION_START_H}:{SESSION_START_M:02d} — {SESSION_END_H}:{SESSION_END_M:02d} (Paris)\n"
     )
     log.info(
-        "Démarrage du bot v6 — Symboles : %s | TF : M15 | R = %d | Scan toutes les %ds",
+        "Démarrage du bot v7 — Symboles : %s | TF : M15 | R = %d | Scan toutes les %ds",
         list(SYMBOLS.values()), RISK_REWARD, SCAN_INTERVAL,
     )
 
