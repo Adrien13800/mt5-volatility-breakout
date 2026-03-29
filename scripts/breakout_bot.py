@@ -1,5 +1,5 @@
 """
-Breakout de Volatilité v6 — Bot MT5 automatisé
+Breakout de Volatilité v7 — Bot MT5 automatisé
 EMA trend filter, ATR-based SL/TP (capped), RSI confirmation,
 Long + Short, trailing progressif.
 """
@@ -30,7 +30,7 @@ TIMEFRAME = mt5.TIMEFRAME_M15
 BB_LENGTH = 20
 BB_STD = 2.0
 VOL_SMA_LENGTH = 20
-VOL_MULTIPLIER = 1.3
+VOL_MULTIPLIER = 1.1  # v7: relâché (était 1.3)
 
 EMA_TREND_LENGTH = 50
 RSI_LENGTH = 14
@@ -38,20 +38,20 @@ ATR_LENGTH = 14
 
 RISK_REWARD = 4
 
-ATR_SL_MULT = 0.75  # v6: SL serré (était 1.25)
-ATR_TP_MULT = ATR_SL_MULT * RISK_REWARD  # 3.0 ATR
-TRAIL_ACTIVATE_R = 1.5  # v6: activation trailing à 1.5R (était 2R)
-ATR_TRAIL_ACTIVATE = TRAIL_ACTIVATE_R * ATR_SL_MULT  # 1.125 ATR
-ATR_TRAIL_DIST = 0.3  # v6: trailing serré (était 0.5)
+ATR_SL_MULT = 0.5  # v7: SL plus serré (était 0.75)
+ATR_TP_MULT = ATR_SL_MULT * RISK_REWARD  # 2.0 ATR
+TRAIL_ACTIVATE_R = 1.5  # v7: inchangé
+ATR_TRAIL_ACTIVATE = TRAIL_ACTIVATE_R * ATR_SL_MULT  # 0.75 ATR
+ATR_TRAIL_DIST = 0.2  # v7: trailing plus serré (était 0.3)
 ATR_MEDIAN_WINDOW = 100
 ATR_CAP_MULT = 1.5
 
 MAGIC_NUMBER = 847291
-RISK_PCT = 0.03  # v6: risk 3% (était 2.5%)
+RISK_PCT = 0.02  # v7: risk 2% (était 3%)
 
 SESSION_START_H = 17  # v4: session optimisée (était 15:30)
 SESSION_START_M = 0
-SESSION_END_H = 21  # v4: (était 22:00)
+SESSION_END_H = 22  # v7: +1h (était 21:00)
 SESSION_END_M = 0
 
 SCAN_INTERVAL = 7
@@ -364,7 +364,12 @@ def modify_sl(symbol: str, ticket: int, new_sl: float, current_tp: float) -> boo
         "magic": MAGIC_NUMBER,
     }
     result = mt5.order_send(request)
-    if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
+    if result is None:
+        log.error("Modification SL échouée ticket %d : résultat None", ticket)
+        return False
+    if result.retcode == 10025:  # No changes — SL already at this value
+        return True
+    if result.retcode != mt5.TRADE_RETCODE_DONE:
         log.error("Modification SL échouée ticket %d : %s", ticket, result)
         return False
 
@@ -449,6 +454,8 @@ def process_symbol(symbol: str):
 
         atr_e = tracking["atr_entry"]
         is_long = pos.type == mt5.ORDER_TYPE_BUY
+        sym_info = mt5.symbol_info(symbol)
+        digits = sym_info.digits if sym_info else 2
 
         if is_long:
             current_price = tick.bid
@@ -457,7 +464,7 @@ def process_symbol(symbol: str):
 
             profit_dist = tracking["best_price"] - pos.price_open
             if profit_dist >= ATR_TRAIL_ACTIVATE * atr_e:
-                new_sl = tracking["best_price"] - ATR_TRAIL_DIST * atr_e
+                new_sl = round(tracking["best_price"] - ATR_TRAIL_DIST * atr_e, digits)
                 if new_sl > pos.sl:
                     modify_sl(symbol, pos.ticket, new_sl, pos.tp)
         else:
@@ -467,7 +474,7 @@ def process_symbol(symbol: str):
 
             profit_dist = pos.price_open - tracking["best_price"]
             if profit_dist >= ATR_TRAIL_ACTIVATE * atr_e:
-                new_sl = tracking["best_price"] + ATR_TRAIL_DIST * atr_e
+                new_sl = round(tracking["best_price"] + ATR_TRAIL_DIST * atr_e, digits)
                 if new_sl < pos.sl:
                     modify_sl(symbol, pos.ticket, new_sl, pos.tp)
 
@@ -514,7 +521,7 @@ def process_symbol(symbol: str):
         return
 
     vol_icon = f"{_C.GREEN}✓{_C.RESET}" if tick_vol > vol_threshold else f"{_C.RED}✗{_C.RESET}"
-    rsi_color = _C.GREEN if 50 < rsi < 70 else (_C.RED if 30 < rsi < 50 else _C.YELLOW)
+    rsi_color = _C.GREEN if 40 < rsi < 65 else (_C.RED if 20 < rsi < 100 else _C.YELLOW)
     print(
         f"  {_C.BOLD}{symbol:<10}{_C.RESET}"
         f"  close {_C.WHITE}{close:>10.2f}{_C.RESET}"
@@ -531,8 +538,8 @@ def process_symbol(symbol: str):
     ema_long = close > ema
     ema_short = close < ema
     vol_ok = tick_vol > vol_threshold
-    rsi_long = 50 < rsi < 70
-    rsi_short = 30 < rsi < 50
+    rsi_long = 40 < rsi < 65   # v7: élargi (était 50-70)
+    rsi_short = 20 < rsi < 100  # v7: quasi ouvert (était 30-50)
 
     # ── Signal Long (différé → exécution à la prochaine bougie) ──
     if bb_long and ema_long and vol_ok and rsi_long:
