@@ -6,6 +6,7 @@ Long + Short, trailing progressif.
 
 import logging
 import os
+import sys
 import time
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
@@ -59,6 +60,10 @@ SCAN_INTERVAL = 7
 MT5_LOGIN = int(os.environ["MT5_LOGIN"])
 MT5_PASSWORD = os.environ["MT5_PASSWORD"]
 MT5_SERVER = os.environ["MT5_SERVER"]
+
+TELEGRAM_ENABLED = True
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 PARIS_TZ = pytz.timezone("Europe/Paris")
 
@@ -132,6 +137,21 @@ _file_errors.setFormatter(logging.Formatter(LOG_FORMAT, datefmt=LOG_DATEFMT))
 _file_errors.setLevel(logging.ERROR)
 log.addHandler(_file_errors)
 
+# ─────────────────────────── TELEGRAM ─────────────────────────────────
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", "Grid-trading", "files"))
+
+
+def notify(message: str) -> None:
+    if not TELEGRAM_ENABLED or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        from notifier import send_telegram
+        send_telegram(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, message)
+    except Exception as e:
+        log.warning("Telegram: %s", e)
+
+
 # ─────────────────────────── STATE ───────────────────────────────────
 
 tracked_positions: dict[str, dict] = {}
@@ -173,6 +193,7 @@ def ensure_connected() -> bool:
             return True
         time.sleep(5 * (attempt + 1))
     log.critical("Impossible de reconnecter MT5 après 3 tentatives.")
+    notify("⚠️ <b>ALERTE</b>\nConnexion MT5 perdue — 3 tentatives échouées")
     return False
 
 
@@ -345,6 +366,11 @@ def open_order(symbol: str, direction: str, sl_dist: float, tp_dist: float) -> f
     trade_log.info(
         "OPEN %s %s @ %.5f | lot=%.3f | SL=%.5f | TP=%.5f | ticket=%d",
         direction.upper(), symbol, fill_price, lot_size, sl, tp, result.order,
+    )
+    notify(
+        f"{'🟢' if direction == 'long' else '🔴'} <b>{direction.upper()} {symbol}</b>\n"
+        f"Prix: {fill_price:.5f}\n"
+        f"Lot: {lot_size:.3f} | SL: {sl:.5f} | TP: {tp:.5f}"
     )
     return fill_price
 
@@ -636,6 +662,15 @@ def main():
         "Démarrage du bot v7 — Symboles : %s | TF : M15 | R = %d | Scan toutes les %ds",
         list(SYMBOLS.values()), RISK_REWARD, SCAN_INTERVAL,
     )
+    account = mt5.account_info()
+    balance_str = f"\nCapital: {account.balance:.2f} $" if account else ""
+    notify(
+        f"🤖 <b>Breakout Bot v7 démarré</b>\n"
+        f"Symboles: {', '.join(SYMBOLS.values())}\n"
+        f"TF: M15 | R:R {RISK_REWARD} | Risk: {RISK_PCT*100:.0f}%\n"
+        f"Session: {SESSION_START_H}:{SESSION_START_M:02d}–{SESSION_END_H}:{SESSION_END_M:02d}"
+        f"{balance_str}"
+    )
 
     scan_count = 0
 
@@ -670,6 +705,7 @@ def main():
 
             except Exception as exc:
                 log.exception("Erreur globale dans la boucle : %s", exc)
+                notify(f"⚠️ <b>Erreur bot</b>\n{exc}")
 
             elapsed = time.monotonic() - scan_start
             time.sleep(max(0, SCAN_INTERVAL - elapsed))
@@ -677,6 +713,13 @@ def main():
     except KeyboardInterrupt:
         log.info("Arrêt demandé par l'utilisateur (Ctrl+C).")
     finally:
+        account = mt5.account_info()
+        if account:
+            notify(
+                f"🛑 <b>Bot arrêté</b>\n"
+                f"P&L: {account.profit:+.2f} $\n"
+                f"Solde: {account.balance:.2f} $"
+            )
         disconnect_mt5()
 
 
