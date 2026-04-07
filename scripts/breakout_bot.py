@@ -22,9 +22,9 @@ load_dotenv()
 # ─────────────────────────── CONFIGURATION ───────────────────────────
 
 SYMBOLS = {
-    "NAS100": "NAS100.",
-    "US30": "DJ30.",
-    "SPX500": "SP500.",
+    "NAS100": "US100.cash",
+    "US30": "US30.cash",
+    "SPX500": "US500.cash",
 }
 
 TIMEFRAME = mt5.TIMEFRAME_M15
