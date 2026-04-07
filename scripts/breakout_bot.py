@@ -60,6 +60,7 @@ SCAN_INTERVAL = 7
 MT5_LOGIN = int(os.environ["MT5_LOGIN"])
 MT5_PASSWORD = os.environ["MT5_PASSWORD"]
 MT5_SERVER = os.environ["MT5_SERVER"]
+MT5_PATH = os.getenv("MT5_PATH", "")
 
 TELEGRAM_ENABLED = True
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -162,7 +163,24 @@ last_processed_candle: dict[str, object] = {}  # dernière bougie traitée par s
 
 
 def connect_mt5() -> bool:
-    if not mt5.initialize(login=MT5_LOGIN, password=MT5_PASSWORD, server=MT5_SERVER):
+    # Try connecting to already-running terminal first (path only, no credentials)
+    if MT5_PATH and mt5.initialize(path=MT5_PATH):
+        account = mt5.account_info()
+        if account is not None:
+            log.info("MT5 connecté au terminal existant.")
+            log.info(
+                "MT5 connecté — compte #%d (%s) | solde=%.2f %s | serveur=%s",
+                account.login, account.name, account.balance,
+                account.currency, account.server,
+            )
+            return True
+        mt5.shutdown()
+
+    # Fallback: full login (may open a new terminal)
+    kwargs = {"login": MT5_LOGIN, "password": MT5_PASSWORD, "server": MT5_SERVER}
+    if MT5_PATH:
+        kwargs["path"] = MT5_PATH
+    if not mt5.initialize(**kwargs):
         log.error("Échec d'initialisation MT5 : %s", mt5.last_error())
         return False
 
