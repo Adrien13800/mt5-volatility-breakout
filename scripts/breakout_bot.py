@@ -12,8 +12,8 @@ from datetime import datetime
 from logging.handlers import RotatingFileHandler
 
 import MetaTrader5 as mt5
+import numpy as np
 import pandas as pd
-import pandas_ta as ta
 import pytz
 from dotenv import load_dotenv
 
@@ -227,26 +227,50 @@ def get_candles(symbol: str, count: int = 200) -> pd.DataFrame | None:
     return df
 
 
-def compute_indicators(df: pd.DataFrame) -> pd.DataFrame | None:
-    bb = ta.bbands(df["close"], length=BB_LENGTH, std=BB_STD)
-    if bb is None:
-        return None
-    col_map = {}
-    for c in bb.columns:
-        if c.startswith("BBU"):
-            col_map[c] = "BBU"
-        elif c.startswith("BBM"):
-            col_map[c] = "BBM"
-        elif c.startswith("BBL"):
-            col_map[c] = "BBL"
-    bb = bb.rename(columns=col_map)
-    df = pd.concat([df, bb], axis=1)
+def _sma(series: pd.Series, length: int) -> pd.Series:
+    return series.rolling(window=length, min_periods=length).mean()
 
-    df["vol_sma"] = ta.sma(df["tick_volume"].astype(float), length=VOL_SMA_LENGTH)
-    df["ema_trend"] = ta.ema(df["close"], length=EMA_TREND_LENGTH)
-    df["rsi"] = ta.rsi(df["close"], length=RSI_LENGTH)
-    atr = ta.atr(df["high"], df["low"], df["close"], length=ATR_LENGTH)
-    if atr is None:
+
+def _ema(series: pd.Series, length: int) -> pd.Series:
+    return series.ewm(span=length, adjust=False).mean()
+
+
+def _rsi(series: pd.Series, length: int) -> pd.Series:
+    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1 / length, min_periods=length, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / length, min_periods=length, adjust=False).mean()
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+
+def _atr(high: pd.Series, low: pd.Series, close: pd.Series, length: int) -> pd.Series:
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    return tr.ewm(alpha=1 / length, min_periods=length, adjust=False).mean()
+
+
+def compute_indicators(df: pd.DataFrame) -> pd.DataFrame | None:
+    # Bollinger Bands
+    bbm = _sma(df["close"], BB_LENGTH)
+    bb_std = df["close"].rolling(window=BB_LENGTH, min_periods=BB_LENGTH).std()
+    df["BBM"] = bbm
+    df["BBU"] = bbm + BB_STD * bb_std
+    df["BBL"] = bbm - BB_STD * bb_std
+
+    if df["BBU"].dropna().empty:
+        return None
+
+    df["vol_sma"] = _sma(df["tick_volume"].astype(float), VOL_SMA_LENGTH)
+    df["ema_trend"] = _ema(df["close"], EMA_TREND_LENGTH)
+    df["rsi"] = _rsi(df["close"], RSI_LENGTH)
+    atr = _atr(df["high"], df["low"], df["close"], ATR_LENGTH)
+    if atr.dropna().empty:
         return None
     df["atr"] = atr
     atr_median = df["atr"].rolling(ATR_MEDIAN_WINDOW, min_periods=1).median()
